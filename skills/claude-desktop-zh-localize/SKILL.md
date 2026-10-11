@@ -30,7 +30,7 @@ for text in ["Theme", "Chat font"]:
     print(text, {k for k, v in en.items() if v == text})
 ```
 
-- 精确匹配不到时用小写子串模糊搜索，并去前端 bundle（`/Applications/Claude.app/Contents/Resources/ion-dist/assets/v1/*.js`）里确认组件写法。
+- 精确匹配不到时用小写子串模糊搜索，并去前端 bundle（`/Applications/Claude.app/Contents/Resources/ion-dist/assets/v1/*.js`；新版 Claude 可能改名或换层级，安装脚本会自动探测，找不到时在 `ion-dist` 下递归搜含 `index-*.js` 的目录）里确认组件写法。
 - 截图里的文本往往是多个 DOM 节点拼出来的（链接前后各一个 text node），要分别找。
 
 ### 第 2 步：确定三地译文
@@ -93,7 +93,7 @@ python3 -m py_compile scripts/patch_claude_zh_cn.py scripts/patch_linux_asar.py
 4. **macOS 与 Windows 引擎必须同步**。只改 Python 不改 ps1，Windows 在线页面会漏翻；反之亦然。
 5. **不要往 `frontend-zh-*.json` 写 en-US.json 里不存在的 key**——合并时会被忽略并计入 `extra old keys`，验证要求该值恒为 0。
 6. **硬编码词表是 dict 合并语义**（后写覆盖同源文），重复添加无害，但弯/直引号、带不带空格是不同 key。
-7. **⚠️ 通用单词/数据标识符严禁进硬编码词表**。硬编码替换会命中 JS 源码里该词的**所有**带引号出现，包括数据上下文。真实事故：`"Pin"→固定` 把 `icon:"Pin"` 图标名改成中文（图标全坏）；`"Engineering"→工程` 把 `workFunction:"Engineering"` 服务端数据值和 `Ax=["...",...]` 角色数组改掉，与未替换的 unquoted 对象键 `Engineering:[...]` 失配 → `f["工程"]` undefined → 连接器页崩溃（`TypeError: e is not iterable`）。判定规则：**单词若同时是 (a) 图标/组件名、(b) 服务端数据值、(c) 对象键/switch-case/数组元素，就绝不能进硬编码词表**——改用 react-intl key（frontend-zh-*.json）提供翻译。若已发生污染：在 `ion-dist/assets/v1/*.js` 中把 `"中文"` 批量还原为英文原词（UI 显示由 intl catalog 提供，不受影响），**不要碰 app.asar（M 映射的键值对是合法的）与 i18n catalog**。
+7. **⚠️ 通用单词/数据标识符严禁进硬编码词表**。硬编码替换会命中 JS 源码里该词的**所有**带引号出现，包括数据上下文。真实事故：`"Pin"→固定` 把 `icon:"Pin"` 图标名改成中文（图标全坏）；`"Engineering"→工程` 把 `workFunction:"Engineering"` 服务端数据值和 `Ax=["...",...]` 角色数组改掉，与未替换的 unquoted 对象键 `Engineering:[...]` 失配 → `f["工程"]` undefined → 连接器页崩溃（`TypeError: e is not iterable`）。判定规则：**单词若同时是 (a) 图标/组件名、(b) 服务端数据值、(c) 对象键/switch-case/数组元素，就绝不能进硬编码词表**——改用 react-intl key（frontend-zh-*.json）提供翻译。若已发生污染：在前端 bundle（默认 `ion-dist/assets/v1/*.js`，脚本会自动探测实际目录）中把 `"中文"` 批量还原为英文原词（UI 显示由 intl catalog 提供，不受影响），**不要碰 app.asar（M 映射的键值对是合法的）与 i18n catalog**。
 8. **主进程菜单翻译自 2.9939.2 起改走 desktop 语言包（intl catalog）**：菜单缺失翻译时应用会把 `Missing message: "<id>" ... (default message (英文)) as fallback` 打到 stderr——前台启动应用收集该日志即可拿到完整的未翻译菜单 key 清单（71 个），写入 `desktop-zh-*.json` 后由 `install_desktop_locale` 合并进 `Contents/Resources/zh-CN.json`。
 9. **⚠️ 2.9939.2（Electron 44）两大挂死**：`patch_online_locale_lock`（DesktopIntl 锁，任何形态包括可重入标志位）与菜单运行时补丁都会让主进程在菜单构建后、窗口创建前陷入 JS 深度递归——进程活着但永远无窗口、AX 超时。两者都已加版本门控（`>= 2.9939.2` 跳过注入），新版菜单由 desktop 语言包覆盖。若需诊断：`sample <pid>` 看主线程是否陷入 JS 深度递归（成千层重复栈帧）。
 10. **应用启动时会把 `Claude-3p/config.json` 的 locale 归一化为系统语言**。修 locale 的正确顺序：杀应用 → 改配置 → 启动；运行时改会被回写覆盖。界面整体回退英文时重跑补丁脚本即可。

@@ -334,14 +334,18 @@ function Write-AsarCoworkSignatureWarning {
 }
 
 function Find-ClaudePath {
-    $packages = @(Get-AppxPackage -Name "Claude" -ErrorAction SilentlyContinue)
+    # 商店版包名可能调整（issue #194：2.19675.0 起改名），按名称/发布者模糊匹配，
+    # 误报由调用方对 resources 目录的校验兜底。
+    $packages = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
+            ($_.Name -like "*Claude*") -or ($_.Publisher -like "*Anthropic*")
+        })
     foreach ($package in $packages) {
         if ($package.InstallLocation -and (Test-Path $package.InstallLocation)) {
             return $package.InstallLocation
         }
     }
 
-    $fallback = Get-ChildItem "C:\Program Files\WindowsApps\Claude_*" -Directory -ErrorAction SilentlyContinue |
+    $fallback = Get-ChildItem "C:\Program Files\WindowsApps" -Directory -Filter "*Claude*" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if ($fallback) {
@@ -349,6 +353,23 @@ function Find-ClaudePath {
     }
 
     return $null
+}
+
+function Get-ClaudeExeProductVersion {
+    param([string]$ClaudePath)
+
+    foreach ($name in @("Claude.exe", "claude.exe")) {
+        $exePath = Join-Path $ClaudePath $name
+        if (Test-Path -LiteralPath $exePath) {
+            try {
+                return [string](Get-Item -LiteralPath $exePath).VersionInfo.ProductVersion
+            }
+            catch {
+                return "未知"
+            }
+        }
+    }
+    return "未知"
 }
 
 function Get-ClaudeExePath {
@@ -391,16 +412,31 @@ function Get-ClaudeResourcesPath {
     $script:DetectedUnpackagedClaudePaths = @(Get-UnpackagedClaudePaths)
     $script:DetectedMultipleClaudeInstalls = $false
 
-    if ($script:DetectedUnpackagedClaudePaths.Count -gt 0) {
-        $claudePath = $script:DetectedUnpackagedClaudePaths[0]
-        $resourcesPath = Join-Path $claudePath "resources"
-        if (-not (Test-Path $resourcesPath)) {
-            throw "未找到 Claude resources 目录: $resourcesPath"
+    # 化石目录防线（issue #196）：升级/换渠道安装后，%LocalAppData%\AnthropicClaude
+    # 可能残留旧渠道的 app-* 目录（例如 fast-ring 时代的 app-1.0.x）。它们能通过
+    # Claude.exe + resources 的基础检测，但里面没有前端 bundle；旧逻辑选中这类目录
+    # 后，前几步往空目录里"成功"写入资源，最后在注册语言时才报
+    # "未找到前端 JS bundle"。这里要求候选目录真的能定位到前端 JS，否则跳过并
+    # 尝试下一个候选；全部无效时回退商店版（AppX）检测。
+    $rejectedHints = @()
+    foreach ($candidatePath in $script:DetectedUnpackagedClaudePaths) {
+        $candidateResources = Join-Path $candidatePath "resources"
+        if (-not (Test-Path $candidateResources)) {
+            $rejectedHints += "  跳过 ${candidatePath}（缺少 resources 目录）"
+            continue
         }
+        if (-not (Resolve-FrontendAssetsDir $candidateResources)) {
+            $rejectedHints += "  跳过 ${candidatePath}（前端 JS bundle 缺失，版本 $(Get-ClaudeExeProductVersion $candidatePath)，疑似残留旧版本目录）"
+            continue
+        }
+
+        $claudePath = $candidatePath
+        $resourcesPath = $candidateResources
         if ($script:DetectedUnpackagedClaudePaths.Count -gt 1) {
             $script:DetectedMultipleClaudeInstalls = $true
-            Write-Host "  [警告] 检测到多个 %LocalAppData%\AnthropicClaude\app-*，将使用最新版本: $claudePath" -ForegroundColor Yellow
+            Write-Host "  [提示] 检测到多个 %LocalAppData%\AnthropicClaude\app-*，已选用可补丁的最新版本: $claudePath" -ForegroundColor Yellow
         }
+        Write-Host "  Claude 版本: $(Get-ClaudeExeProductVersion $claudePath)" -ForegroundColor DarkGray
         return @{
             App = $claudePath
             Resources = $resourcesPath
@@ -408,16 +444,34 @@ function Get-ClaudeResourcesPath {
         }
     }
 
+    if ($script:DetectedUnpackagedClaudePaths.Count -gt 0) {
+        Write-Host "  [警告] 以下本地 app-* 目录无法作为补丁目标：" -ForegroundColor Yellow
+        foreach ($hint in $rejectedHints) {
+            Write-Host $hint -ForegroundColor Yellow
+        }
+        Write-Host "  [提示] 继续尝试商店版（AppX）安装检测。" -ForegroundColor Yellow
+    }
+
     $claudePath = Find-ClaudePath
     if (-not $claudePath) {
+        if ($script:DetectedUnpackagedClaudePaths.Count -gt 0) {
+            throw "未找到可补丁的 Claude Desktop 安装：本地 app-* 目录均缺前端 bundle，商店版也未检测到。请确认 Claude Desktop 已完整安装（安装后至少启动过一次），或清理旧 app-* 目录后重试。"
+        }
         throw "未找到 Claude Desktop 安装。"
     }
 
     $resourcesPath = Join-Path $claudePath "app\resources"
     if (-not (Test-Path $resourcesPath)) {
-        throw "未找到 Claude resources 目录: $resourcesPath"
+        $resourcesPath = Join-Path $claudePath "resources"
+    }
+    if (-not (Test-Path $resourcesPath)) {
+        throw "未找到 Claude resources 目录: $(Join-Path $claudePath 'app\resources')"
+    }
+    if (-not (Resolve-FrontendAssetsDir $resourcesPath)) {
+        throw "未找到前端 JS bundle: $resourcesPath\ion-dist。Claude 前端目录结构可能已变化，请带上安装日志反馈。"
     }
 
+    Write-Host "  Claude 版本: $(Get-ClaudeExeProductVersion $claudePath)" -ForegroundColor DarkGray
     return @{
         App = $claudePath
         Resources = $resourcesPath
@@ -1214,7 +1268,8 @@ function Get-FrontendJsFilesContaining {
 
     $jsFiles = @(Get-ChildItem (Join-Path $AssetsDir "*.js") -File -ErrorAction SilentlyContinue)
     if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 JS bundle: $AssetsDir"
+        Write-Host "  [提示] 目录中没有前端 JS 文件: $AssetsDir" -ForegroundColor DarkYellow
+        return @()
     }
 
     $patterns = @($Needles | Where-Object { $_ })
@@ -1254,16 +1309,57 @@ function Get-FrontendJsFilesContaining {
     return @($matched)
 }
 
+function Resolve-FrontendAssetsDir {
+    param([string]$ResourcesPath)
+
+    # 已知布局（Claude 2.x 至 2.31226.1）：ion-dist\assets\v1
+    $known = Join-Path $ResourcesPath "ion-dist\assets\v1"
+    if (Test-Path (Join-Path $known "*.js")) {
+        return $known
+    }
+
+    # 兼容未来版本的目录改名/层级变化：在 ion-dist 下递归（限深 3 层）找含 JS
+    # bundle 的目录，优先带 index-*.js 的目录，并用语言白名单锚点确认是前端主
+    # bundle，避免误选 worker 等辅助 JS 目录。
+    $ionDist = Join-Path $ResourcesPath "ion-dist"
+    if (-not (Test-Path $ionDist)) {
+        return $null
+    }
+
+    $probeNeedle = '"en-US","de-DE","fr-FR","ko-KR","ja-JP"'
+    $candidateDirs = @(Get-ChildItem $ionDist -Directory -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName "*.js") } |
+        Sort-Object @{ Expression = { Test-Path (Join-Path $_.FullName "index-*.js") }; Descending = $true })
+    foreach ($dir in $candidateDirs) {
+        $matched = @(Get-FrontendJsFilesContaining $dir.FullName @($probeNeedle))
+        if ($matched.Count -gt 0) {
+            return $dir.FullName
+        }
+    }
+
+    # 锚点扫不到时退而求其次：主 bundle 目录几乎必含 index-*.js
+    foreach ($dir in $candidateDirs) {
+        if (Test-Path (Join-Path $dir.FullName "index-*.js")) {
+            return $dir.FullName
+        }
+    }
+
+    return $null
+}
+
 function Register-Language {
     param(
         [string]$ResourcesPath,
         [string]$Lang
     )
 
-    $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
+    if (-not $assetsDir) {
+        throw "未找到前端 JS bundle（在 $ResourcesPath\ion-dist 下未定位到前端主 bundle）。Claude 前端目录结构可能已变化，请带上安装日志反馈。"
+    }
     $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @('"en-US","de-DE","fr-FR","ko-KR","ja-JP"'))
     if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 JS bundle: $assetsDir"
+        throw "未能注册中文语言：前端 bundle ($assetsDir) 中找不到语言白名单锚点，Claude 前端格式可能已经变化。"
     }
 
     $regex = [System.Text.RegularExpressions.Regex]::new($LanguageListPattern)
@@ -1299,8 +1395,12 @@ function Register-Language {
 function Patch-LanguageDisplayNames {
     param([string]$ResourcesPath)
 
-    $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
     $marker = "__claudeZhLabelPatch"
+    if (-not $assetsDir) {
+        Write-Host "  [提示] 未定位到前端 JS bundle，跳过语言显示名补丁。" -ForegroundColor DarkYellow
+        return
+    }
     $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @("Intl.DisplayNames", $marker))
     if ($jsFiles.Count -eq 0) {
         Write-Host "  no Intl.DisplayNames bundle found; skipping language display names" -ForegroundColor DarkYellow
@@ -1330,10 +1430,10 @@ function Patch-LanguageDisplayNames {
 function Unregister-Language {
     param([string]$ResourcesPath)
 
-    $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    if (-not (Test-Path (Join-Path $assetsDir "*.js"))) {
-        # Claude 已被卸载或资源目录不存在时安静跳过, 不阻断卸载流程
-        Write-Host "  [提示] 未找到前端 JS 目录($assetsDir)，跳过语言注销。" -ForegroundColor DarkYellow
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
+    if (-not $assetsDir) {
+        # Claude 已被卸载或前端目录无法定位时安静跳过, 不阻断卸载流程
+        Write-Host "  [提示] 未定位到前端 JS bundle($ResourcesPath\ion-dist)，跳过语言注销。" -ForegroundColor DarkYellow
         return
     }
     $needles = @(',"zh-CN"', ',"zh-TW"', ',"zh-HK"')
@@ -2359,11 +2459,11 @@ function Patch-HardcodedFrontendStrings {
         [string]$Language
     )
 
-    $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
-    if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 JS bundle: $assetsDir"
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
+    if (-not $assetsDir) {
+        throw "未找到前端 JS bundle: $(Join-Path $ResourcesPath 'ion-dist')"
     }
+    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -File -ErrorAction SilentlyContinue)
 
     $replacements = @(Get-FrontendHardcodedReplacements $Language)
 

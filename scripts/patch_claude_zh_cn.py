@@ -41,6 +41,7 @@ BACKUP_GLOB = "Claude.backup-before-zh-CN-*.app"
 APP_ASAR_REL = Path("Contents/Resources/app.asar")
 FRONTEND_I18N_REL = Path("Contents/Resources/ion-dist/i18n")
 FRONTEND_ASSETS_REL = Path("Contents/Resources/ion-dist/assets/v1")
+FRONTEND_PROBE_NEEDLE = '"en-US","de-DE","fr-FR","ko-KR","ja-JP"'
 DESKTOP_RESOURCES_REL = Path("Contents/Resources")
 ASAR_INTEGRITY_BLOCK_SIZE = 4 * 1024 * 1024
 ONLINE_LOCALE_MAIN_MARKER = "__claudeZhOnlineLocaleMain"
@@ -178,11 +179,51 @@ def copy_app(src: Path, dst: Path) -> None:
     log(f"Copied app to temporary workspace in {elapsed_since(start)}")
 
 
+def find_frontend_assets_dir(app: Path) -> Path | None:
+    """Locate the frontend JS bundle directory under the app.
+
+    已知布局（Claude 2.x 至 2.31226.1）是 Contents/Resources/ion-dist/assets/v1；
+    新版本若改名或换层级，则在 ion-dist 下递归查找：优先返回命中语言白名单锚点
+    的目录（前端主 bundle），其次含 index-*.js 的目录，避免误选 worker 等辅助
+    JS 目录（issue #196 同类风险的 Mac 侧防线）。
+    """
+    known = app / FRONTEND_ASSETS_REL
+    if any(known.glob("*.js")):
+        return known
+
+    ion_dist = app / "Contents/Resources/ion-dist"
+    if not ion_dist.is_dir():
+        return None
+
+    needle_hits: list[Path] = []
+    index_dirs: list[Path] = []
+    for js_path in sorted(ion_dist.rglob("*.js")):
+        if not js_path.is_file():
+            continue
+        if js_path.name.startswith("index-") and js_path.parent not in index_dirs:
+            index_dirs.append(js_path.parent)
+        if js_path.parent not in needle_hits:
+            try:
+                if FRONTEND_PROBE_NEEDLE in js_path.read_text(encoding="utf-8"):
+                    needle_hits.append(js_path.parent)
+            except (OSError, UnicodeDecodeError):
+                continue
+
+    if needle_hits:
+        return needle_hits[0]
+    if index_dirs:
+        return index_dirs[0]
+    return None
+
+
 def patch_language_whitelist(app: Path, lang_code: str) -> Path:
-    assets_dir = app / FRONTEND_ASSETS_REL
+    assets_dir = find_frontend_assets_dir(app)
+    if assets_dir is None:
+        raise SystemExit(
+            f"Cannot find frontend JS bundle under {app / 'Contents/Resources/ion-dist'} "
+            f"(looked for {FRONTEND_ASSETS_REL} and any index bundle with the language whitelist)"
+        )
     candidates = sorted(assets_dir.glob("*.js"))
-    if not candidates:
-        raise SystemExit(f"Cannot find frontend JS bundle in {assets_dir}")
 
     replacement = f'{BASE_LANGUAGE_LIST},"{lang_code}"]'
 
@@ -201,7 +242,11 @@ def patch_language_whitelist(app: Path, lang_code: str) -> Path:
 
 
 def patch_language_display_names(app: Path) -> None:
-    assets_dir = app / FRONTEND_ASSETS_REL
+    assets_dir = find_frontend_assets_dir(app)
+    if assets_dir is None:
+        raise SystemExit(
+            f"Cannot find frontend JS bundle under {app / 'Contents/Resources/ion-dist'}"
+        )
     candidates = sorted(assets_dir.glob("index-*.js"))
     if not candidates:
         raise SystemExit(f"Cannot find frontend index bundle in {assets_dir}")
@@ -320,7 +365,11 @@ def _patch_frontend_file(path_str: str) -> tuple[bool, int]:
 
 def patch_hardcoded_frontend_strings(app: Path, lang_code: str) -> None:
     start = time.perf_counter()
-    assets_dir = app / FRONTEND_ASSETS_REL
+    assets_dir = find_frontend_assets_dir(app)
+    if assets_dir is None:
+        raise SystemExit(
+            f"Cannot find frontend JS bundle under {app / 'Contents/Resources/ion-dist'}"
+        )
     replacement_items = sorted(
         load_frontend_hardcoded_replacements(lang_code),
         key=lambda item: len(item[0]),
