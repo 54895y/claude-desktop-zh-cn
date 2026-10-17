@@ -127,24 +127,30 @@ jobs:
         run: |
           $isl = 'C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl'
           if (Test-Path $isl) {
-            @"
-[Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-"@ | Set-Content 'installer\lang.iss' -Encoding UTF8
+            $lines = @(
+              '[Languages]',
+              'Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"'
+            )
+            Set-Content 'installer\lang.iss' -Value $lines -Encoding UTF8
             Write-Host 'Using Simplified Chinese wizard language'
           } else {
-            '; chinese language file not shipped, falling back to default (English) messages' |
-              Set-Content 'installer\lang.iss' -Encoding UTF8
+            $lines = @('; chinese language file not shipped, default messages are used')
+            Set-Content 'installer\lang.iss' -Value $lines -Encoding UTF8
             Write-Host 'Chinese .isl missing, using default messages'
           }
 
       - name: Compile installer
         shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+          APP_VERSION_NUMERIC: ${{ steps.ver.outputs.numeric }}
+          BUILD_SHA: ${{ steps.ver.outputs.sha }}
         run: |
-          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
-            "/DAppVersion=${{ steps.ver.outputs.version }}" `
-            "/DAppVersionNumeric=${{ steps.ver.outputs.numeric }}" `
-            "/DBuildSha=${{ steps.ver.outputs.sha }}" `
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          & $iscc `
+            "/DAppVersion=$env:APP_VERSION" `
+            "/DAppVersionNumeric=$env:APP_VERSION_NUMERIC" `
+            "/DBuildSha=$env:BUILD_SHA" `
             'installer\claude-desktop-zh-cn.iss'
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
