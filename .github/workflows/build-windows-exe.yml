@@ -1,0 +1,175 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional version override, e.g. 1.4.11"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "installer/**"
+      - ".github/workflows/build-windows-exe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows installer (exe)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          Write-Host "ISCC present: $(Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')"
+          Write-Host "7-Zip present: $(Test-Path 'C:\Program Files\7-Zip\7z.exe')"
+          if (Test-Path 'C:\Program Files (x86)\Inno Setup 6\Languages') {
+            Get-ChildItem 'C:\Program Files (x86)\Inno Setup 6\Languages' -Filter *.isl |
+              Select-Object -ExpandProperty Name
+          }
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            Write-Host 'Inno Setup not found, installing via Chocolatey...'
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup compiler (ISCC.exe) not found' }
+          Write-Host "ISCC: $iscc"
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $ver = '0.0.0'
+          if (Test-Path 'resources/release.json') {
+            try { $ver = (Get-Content 'resources/release.json' -Raw | ConvertFrom-Json).release } catch {}
+          }
+          if ('${{ inputs.version }}' -ne '') { $ver = '${{ inputs.version }}' }
+
+          $sha = (git rev-parse --short HEAD).Trim()
+          $numeric = ($ver -replace '[^0-9\.]', '')
+          if ([string]::IsNullOrWhiteSpace($numeric)) { $numeric = '1.0.0' }
+          while ((($numeric -split '\.') | Where-Object { $_ -ne '' }).Count -lt 4) { $numeric = "$numeric.0" }
+
+          "version=$ver"     >> $env:GITHUB_OUTPUT
+          "sha=$sha"         >> $env:GITHUB_OUTPUT
+          "numeric=$numeric" >> $env:GITHUB_OUTPUT
+          Write-Host "version=$ver sha=$sha numeric=$numeric"
+
+      - name: Generate app icon
+        shell: pwsh
+        run: |
+          try {
+            Add-Type -AssemblyName System.Drawing
+            $s = 256
+            $bmp = New-Object System.Drawing.Bitmap $s, $s
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+            $g.Clear([System.Drawing.Color]::Transparent)
+
+            $r = 58; $w = 236; $x = 10
+            $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+            $path.AddArc($x, $x, $r, $r, 180, 90)
+            $path.AddArc($x + $w - $r, $x, $r, $r, 270, 90)
+            $path.AddArc($x + $w - $r, $x + $w - $r, $r, $r, 0, 90)
+            $path.AddArc($x, $x + $w - $r, $r, $r, 90, 90)
+            $path.CloseFigure()
+
+            $rect = New-Object System.Drawing.Rectangle 0, 0, $s, $s
+            $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush $rect, `
+              ([System.Drawing.Color]::FromArgb(255, 217, 119, 87)), `
+              ([System.Drawing.Color]::FromArgb(255, 143, 66, 49)), 45.0
+            $g.FillPath($grad, $path)
+
+            $font = New-Object System.Drawing.Font 'Microsoft YaHei', 118, `
+              ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
+            $sf = New-Object System.Drawing.StringFormat
+            $sf.Alignment = [System.Drawing.StringAlignment]::Center
+            $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+            $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
+            $layout = New-Object System.Drawing.RectangleF 0, 8, $s, $s
+            $g.DrawString('中', $font, $brush, $layout, $sf)
+            $g.Dispose()
+
+            $ms = New-Object System.IO.MemoryStream
+            $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            $png = $ms.ToArray()
+            $bmp.Dispose()
+
+            $ico = New-Object System.IO.MemoryStream
+            $bw = New-Object System.IO.BinaryWriter $ico
+            $bw.Write([UInt16]0); $bw.Write([UInt16]1); $bw.Write([UInt16]1)
+            $bw.Write([byte]0);   $bw.Write([byte]0)
+            $bw.Write([byte]0);   $bw.Write([byte]0)
+            $bw.Write([UInt16]1); $bw.Write([UInt16]32)
+            $bw.Write([UInt32]$png.Length); $bw.Write([UInt32]22)
+            $bw.Write($png); $bw.Flush()
+
+            [System.IO.File]::WriteAllBytes('installer\app.ico', $ico.ToArray())
+            Write-Host "icon written: $((Get-Item 'installer\app.ico').Length) bytes"
+          } catch {
+            Write-Warning "icon generation failed, falling back to default icon: $_"
+          }
+
+      - name: Prepare language file
+        shell: pwsh
+        run: |
+          $isl = 'C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl'
+          if (Test-Path $isl) {
+            @"
+[Languages]
+Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+"@ | Set-Content 'installer\lang.iss' -Encoding UTF8
+            Write-Host 'Using Simplified Chinese wizard language'
+          } else {
+            '; chinese language file not shipped, falling back to default (English) messages' |
+              Set-Content 'installer\lang.iss' -Encoding UTF8
+            Write-Host 'Chinese .isl missing, using default messages'
+          }
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
+            "/DAppVersion=${{ steps.ver.outputs.version }}" `
+            "/DAppVersionNumeric=${{ steps.ver.outputs.numeric }}" `
+            "/DBuildSha=${{ steps.ver.outputs.sha }}" `
+            'installer\claude-desktop-zh-cn.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+      - name: Show output
+        shell: pwsh
+        run: |
+          Get-ChildItem dist | Format-Table Name, Length -AutoSize
+          Get-ChildItem dist -Filter *.exe | ForEach-Object {
+            $v = $_.VersionInfo
+            Write-Host "$($_.Name) | $($v.FileDescription) | $($v.FileVersion) | $([math]::Round($_.Length/1MB,2)) MB"
+          }
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -Filter *.exe | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)" | Set-Content "dist\$($_.Name).sha256.txt" -Encoding ASCII
+            Write-Host "$($_.Name): $h"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-desktop-zh-cn-windows-exe
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
